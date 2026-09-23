@@ -6,6 +6,8 @@ use anchor_lang::{
 };
 use anchor_spl::token_interface::spl_token_2022::{
     extension::{
+        default_account_state::DefaultAccountState,
+        metadata_pointer::MetadataPointer,
         default_account_state::instruction::initialize_default_account_state,
         mint_close_authority::MintCloseAuthority, transfer_fee::TransferFeeConfig,
         BaseStateWithExtensions, ExtensionType, StateWithExtensions,
@@ -207,16 +209,31 @@ fn manual_path_produces_a_working_transfer_fee_mint() {
     send(&mut svm, &payer, ix, &[&mint]);
  
     let account = svm.get_account(&mint.pubkey()).unwrap();
-    assert_eq!(account.data.len(), 314);
+    let expected_len = ExtensionType::try_calculate_account_len::<MintState>(&[
+        ExtensionType::MintCloseAuthority,
+        ExtensionType::MetadataPointer,
+        ExtensionType::DefaultAccountState,
+        ExtensionType::TransferFeeConfig,
+    ])
+    .unwrap();
+    assert_eq!(account.data.len(), expected_len);
  
     let state = StateWithExtensions::<MintState>::unpack(&account.data).unwrap();
     assert_eq!(
         state.get_extension_types().unwrap(),
         vec![
             ExtensionType::MintCloseAuthority,
+            ExtensionType::MetadataPointer,
+            ExtensionType::DefaultAccountState,
             ExtensionType::TransferFeeConfig,
         ]
     );
+
+    let pointer = state.get_extension::<MetadataPointer>().unwrap();
+    assert_eq!(Option::<Pubkey>::from(pointer.metadata_address), Some(mint.pubkey()));
+
+    let default_state = state.get_extension::<DefaultAccountState>().unwrap();
+    assert_eq!(default_state.state, 2);
  
     let config = state.get_extension::<TransferFeeConfig>().unwrap();
     assert_eq!(

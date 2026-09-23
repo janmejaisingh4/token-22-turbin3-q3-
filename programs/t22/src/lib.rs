@@ -2,18 +2,25 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke;
 use anchor_spl::token_interface::{
-    approve, initialize_mint2, mint_close_authority_initialize, spl_token_2022, transfer_checked, transfer_fee_initialize, Approve,
-    InitializeMint2, Mint, MintCloseAuthorityInitialize, TokenInterface, TransferChecked, TransferFeeInitialize,
+    approve, default_account_state_initialize, initialize_mint2, metadata_pointer_initialize,
+    mint_close_authority_initialize, permanent_delegate_initialize, spl_token_2022,
+    thaw_account, transfer_checked, transfer_fee_initialize, Approve,
+    DefaultAccountStateInitialize, InitializeMint2, MetadataPointerInitialize, Mint,
+    MintCloseAuthorityInitialize, PermanentDelegateInitialize, ThawAccount, TokenInterface,
+    TransferChecked, TransferFeeInitialize,
 };
 use spl_token_2022::{
     extension::{
-        confidential_transfer::{instruction as confidential_instruction, DecryptableBalance},
+        confidential_transfer::{
+            instruction as confidential_instruction, DecryptableBalance,
+        },
         confidential_transfer_fee::instruction as confidential_fee_instruction,
-        transfer_fee::TransferFeeConfig, BaseStateWithExtensions, ExtensionType,
-        StateWithExtensions,
+        transfer_fee::{instruction as transfer_fee_instruction, TransferFeeConfig},
+        BaseStateWithExtensions, ExtensionType, StateWithExtensions,
     },
-    state::Mint as MintState,
+    state::{AccountState, Mint as MintState},
 };
+use proofext05::instruction::ProofLocation;
 
 // The length of a ciphertext which is how a decryptable balance is represented in the account data
 pub const AE_CIPHERTEXT_LEN: usize = 36;
@@ -25,6 +32,8 @@ const SUPPORTED_EXTENSIONS: &[ExtensionType] = &[
     ExtensionType::MintCloseAuthority,
     ExtensionType::MetadataPointer,
     ExtensionType::TransferFeeConfig,
+    ExtensionType::PermanentDelegate,
+    ExtensionType::ConfidentialTransferMint,
 ];
 
 #[program]
@@ -72,6 +81,8 @@ pub mod t22 {
     ) -> Result<()> {
         let extensions = [
             ExtensionType::MintCloseAuthority,
+            ExtensionType::MetadataPointer,
+            ExtensionType::DefaultAccountState,
             ExtensionType::TransferFeeConfig,
         ];
  
@@ -105,6 +116,29 @@ pub mod t22 {
             ),
             Some(&ctx.accounts.payer.key()),
         )?;
+
+        metadata_pointer_initialize(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                MetadataPointerInitialize {
+                    token_program_id: ctx.accounts.token_program.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                },
+            ),
+            Some(ctx.accounts.payer.key()),
+            Some(ctx.accounts.mint.key()),
+        )?;
+
+        default_account_state_initialize(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                DefaultAccountStateInitialize {
+                    token_program_id: ctx.accounts.token_program.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                },
+            ),
+            &AccountState::Frozen,
+        )?;
  
         transfer_fee_initialize(
             CpiContext::new(
@@ -132,7 +166,7 @@ pub mod t22 {
             ),
             decimals,
             &ctx.accounts.payer.key(),
-            None,
+            Some(&ctx.accounts.payer.key()),
         )?;
  
         msg!(
@@ -141,6 +175,49 @@ pub mod t22 {
             space
         );
         Ok(())
+    }
+
+    pub fn transfer_with_fee(ctx: Context<TransferWithFee>, amount: u64) -> Result<()> {
+        let mint_data = ctx.accounts.mint.try_borrow_data()?;
+        let mint_state = StateWithExtensions::<MintState>::unpack(&mint_data)?;
+        let fee_config = mint_state.get_extension::<TransferFeeConfig>()?;
+        let fee = fee_config
+            .calculate_epoch_fee(Clock::get()?.epoch, amount)
+            .ok_or_else(|| error!(MintError::FeeCalculationOverflow))?;
+
+        let ix = transfer_fee_instruction::transfer_checked_with_fee(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.source.key(),
+            &ctx.accounts.mint.key(),
+            &ctx.accounts.destination.key(),
+            &ctx.accounts.authority.key(),
+            &[],
+            amount,
+            mint_state.base.decimals,
+            fee,
+        )?;
+        invoke(
+            &ix,
+            &[
+                ctx.accounts.source.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.destination.to_account_info(),
+                ctx.accounts.authority.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn thaw_after_kyc(ctx: Context<ThawAfterKyc>) -> Result<()> {
+        thaw_account(CpiContext::new(
+            ctx.accounts.token_program.key(),
+            ThawAccount {
+                account: ctx.accounts.token_account.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                authority: ctx.accounts.freeze_authority.to_account_info(),
+            },
+        ))
     }
 
     /// `InterfaceAccount<'info, Mint>` looks like it gives you the whole mint.
@@ -329,12 +406,15 @@ pub mod t22 {
         amount: u64,
         decimals: u8,
     ) -> Result<()> {
+        let _ = decimals;
+        let mint_data = ctx.accounts.mint.try_borrow_data()?;
+        let mint_state = StateWithExtensions::<MintState>::unpack(&mint_data)?;
         let ix = confidential_instruction::deposit(
             &ctx.accounts.token_program.key(),
             &ctx.accounts.token_account.key(),
             &ctx.accounts.mint.key(),
             amount,
-            decimals,
+            mint_state.base.decimals,
             &ctx.accounts.authority.key(),
             &[],
         )?;
@@ -386,12 +466,279 @@ pub mod t22 {
     }
     
      /// Creates a mint whose permanent delegate is the payer.
+    pub fn reissue_confidential_seizable_mint(
+        ctx: Context<ReissueConfidentialSeizableMint>,
+        decimals: u8,
+        basis_points: u16,
+        maximum_fee: u64,
+        withdraw_withheld_authority_elgamal_pubkey: [u8; 32],
+    ) -> Result<()> {
+        let extensions = [
+            ExtensionType::MintCloseAuthority,
+            ExtensionType::MetadataPointer,
+            ExtensionType::DefaultAccountState,
+            ExtensionType::TransferFeeConfig,
+            ExtensionType::PermanentDelegate,
+            ExtensionType::ConfidentialTransferMint,
+            ExtensionType::ConfidentialTransferFeeConfig,
+        ];
+        let space = ExtensionType::try_calculate_account_len::<MintState>(&extensions)?;
+        let lamports = Rent::get()?.minimum_balance(space);
+        anchor_lang::system_program::create_account(
+            CpiContext::new(
+                ctx.accounts.system_program.key(),
+                anchor_lang::system_program::CreateAccount {
+                    from: ctx.accounts.payer.to_account_info(),
+                    to: ctx.accounts.mint.to_account_info(),
+                },
+            ),
+            lamports,
+            space as u64,
+            &ctx.accounts.token_program.key(),
+        )?;
+
+        let mint_info = ctx.accounts.mint.to_account_info();
+        let program_info = ctx.accounts.token_program.to_account_info();
+        mint_close_authority_initialize(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                MintCloseAuthorityInitialize {
+                    token_program_id: program_info.clone(),
+                    mint: mint_info.clone(),
+                },
+            ),
+            Some(&ctx.accounts.payer.key()),
+        )?;
+        metadata_pointer_initialize(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                MetadataPointerInitialize {
+                    token_program_id: program_info.clone(),
+                    mint: mint_info.clone(),
+                },
+            ),
+            Some(ctx.accounts.payer.key()),
+            Some(ctx.accounts.mint.key()),
+        )?;
+        default_account_state_initialize(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                DefaultAccountStateInitialize {
+                    token_program_id: program_info.clone(),
+                    mint: mint_info.clone(),
+                },
+            ),
+            &AccountState::Frozen,
+        )?;
+        transfer_fee_initialize(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                TransferFeeInitialize {
+                    token_program_id: program_info.clone(),
+                    mint: mint_info.clone(),
+                },
+            ),
+            Some(&ctx.accounts.payer.key()),
+            Some(&ctx.accounts.payer.key()),
+            basis_points,
+            maximum_fee,
+        )?;
+        permanent_delegate_initialize(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                PermanentDelegateInitialize {
+                    token_program_id: program_info.clone(),
+                    mint: mint_info.clone(),
+                },
+            ),
+            &ctx.accounts.payer.key(),
+        )?;
+        invoke(
+            &confidential_instruction::initialize_mint(
+                &ctx.accounts.token_program.key(),
+                &ctx.accounts.mint.key(),
+                Some(ctx.accounts.payer.key()),
+                false,
+                None,
+            )?,
+            &[mint_info.clone(), program_info.clone()],
+        )?;
+        invoke(
+            &confidential_fee_instruction::initialize_confidential_transfer_fee_config(
+                &ctx.accounts.token_program.key(),
+                &ctx.accounts.mint.key(),
+                Some(ctx.accounts.payer.key()),
+                &withdraw_withheld_authority_elgamal_pubkey.into(),
+            )?,
+            &[mint_info.clone(), program_info.clone()],
+        )?;
+        initialize_mint2(
+            CpiContext::new(
+                ctx.accounts.token_program.key(),
+                InitializeMint2 { mint: mint_info },
+            ),
+            decimals,
+            &ctx.accounts.payer.key(),
+            Some(&ctx.accounts.payer.key()),
+        )?;
+        Ok(())
+    }
+
     pub fn create_seizable_mint(ctx: Context<CreateSeizableMint>, decimals: u8) -> Result<()> {
-        msg!("seizable mint {} with {} deccimals, permanent delegate", 
-        ctx.accounts.mint.key(),
-        decimals,
-        // ctx.accounts.payer.key()
-    );
+        msg!(
+            "seizable mint {} with {} decimals, permanent delegate",
+            ctx.accounts.mint.key(),
+            decimals
+        );
+        Ok(())
+    }
+
+    pub fn configure_confidential_account(
+        ctx: Context<ConfigureConfidentialAccount>,
+        decryptable_zero_balance: [u8; AE_CIPHERTEXT_LEN],
+        maximum_pending_balance_credit_counter: u64,
+    ) -> Result<()> {
+        let ix = confidential_instruction::inner_configure_account(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.token_account.key(),
+            &ctx.accounts.mint.key(),
+            &DecryptableBalance::from(decryptable_zero_balance),
+            maximum_pending_balance_credit_counter,
+            &ctx.accounts.owner.key(),
+            &[],
+            ProofLocation::ContextStateAccount(&ctx.accounts.proof_context.key()),
+        )?;
+        invoke(
+            &ix,
+            &[
+                ctx.accounts.token_account.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.proof_context.to_account_info(),
+                ctx.accounts.owner.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn withdraw_confidential(
+        ctx: Context<WithdrawConfidential>,
+        amount: u64,
+        new_decryptable_available_balance: [u8; AE_CIPHERTEXT_LEN],
+    ) -> Result<()> {
+        let mint_data = ctx.accounts.mint.try_borrow_data()?;
+        let mint_state = StateWithExtensions::<MintState>::unpack(&mint_data)?;
+        let ix = confidential_instruction::inner_withdraw(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.token_account.key(),
+            &ctx.accounts.mint.key(),
+            amount,
+            mint_state.base.decimals,
+            &DecryptableBalance::from(new_decryptable_available_balance),
+            &ctx.accounts.owner.key(),
+            &[],
+            ProofLocation::ContextStateAccount(&ctx.accounts.equality_proof_context.key()),
+            ProofLocation::ContextStateAccount(&ctx.accounts.range_proof_context.key()),
+        )?;
+        invoke(
+            &ix,
+            &[
+                ctx.accounts.token_account.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.equality_proof_context.to_account_info(),
+                ctx.accounts.range_proof_context.to_account_info(),
+                ctx.accounts.owner.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn withdraw_confidential_after_apply(
+        ctx: Context<WithdrawConfidential>,
+        expected_pending_balance_credit_counter: u64,
+        new_decryptable_available_balance: [u8; AE_CIPHERTEXT_LEN],
+        amount: u64,
+        new_decryptable_balance_after_withdrawal: [u8; AE_CIPHERTEXT_LEN],
+    ) -> Result<()> {
+        let apply_ix = confidential_instruction::apply_pending_balance(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.token_account.key(),
+            expected_pending_balance_credit_counter,
+            &DecryptableBalance::from(new_decryptable_available_balance),
+            &ctx.accounts.owner.key(),
+            &[],
+        )?;
+        invoke(
+            &apply_ix,
+            &[
+                ctx.accounts.token_account.to_account_info(),
+                ctx.accounts.owner.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+
+        let mint_data = ctx.accounts.mint.try_borrow_data()?;
+        let mint_state = StateWithExtensions::<MintState>::unpack(&mint_data)?;
+        let withdraw_ix = confidential_instruction::inner_withdraw(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.token_account.key(),
+            &ctx.accounts.mint.key(),
+            amount,
+            mint_state.base.decimals,
+            &DecryptableBalance::from(new_decryptable_balance_after_withdrawal),
+            &ctx.accounts.owner.key(),
+            &[],
+            ProofLocation::ContextStateAccount(&ctx.accounts.equality_proof_context.key()),
+            ProofLocation::ContextStateAccount(&ctx.accounts.range_proof_context.key()),
+        )?;
+        invoke(
+            &withdraw_ix,
+            &[
+                ctx.accounts.token_account.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.equality_proof_context.to_account_info(),
+                ctx.accounts.range_proof_context.to_account_info(),
+                ctx.accounts.owner.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn transfer_confidential(
+        ctx: Context<TransferConfidential>,
+        new_source_decryptable_available_balance: [u8; AE_CIPHERTEXT_LEN],
+        auditor_ciphertext_lo: [u8; 64],
+        auditor_ciphertext_hi: [u8; 64],
+    ) -> Result<()> {
+        let ix = confidential_instruction::inner_transfer(
+            &ctx.accounts.token_program.key(),
+            &ctx.accounts.source.key(),
+            &ctx.accounts.mint.key(),
+            &ctx.accounts.destination.key(),
+            &DecryptableBalance::from(new_source_decryptable_available_balance),
+            &auditor_ciphertext_lo.into(),
+            &auditor_ciphertext_hi.into(),
+            &ctx.accounts.owner.key(),
+            &[],
+            ProofLocation::ContextStateAccount(&ctx.accounts.equality_proof_context.key()),
+            ProofLocation::ContextStateAccount(&ctx.accounts.ciphertext_validity_context.key()),
+            ProofLocation::ContextStateAccount(&ctx.accounts.range_proof_context.key()),
+        )?;
+        invoke(
+            &ix,
+            &[
+                ctx.accounts.source.to_account_info(),
+                ctx.accounts.mint.to_account_info(),
+                ctx.accounts.destination.to_account_info(),
+                ctx.accounts.equality_proof_context.to_account_info(),
+                ctx.accounts.ciphertext_validity_context.to_account_info(),
+                ctx.accounts.range_proof_context.to_account_info(),
+                ctx.accounts.owner.to_account_info(),
+                ctx.accounts.token_program.to_account_info(),
+            ],
+        )?;
         Ok(())
     }
  
@@ -467,9 +814,13 @@ pub mod t22 {
           // Available from the typed account, no extension awareness needed.
         let decimals = state.base.decimals;
  
-        for extension in state.get_extension_types()? {
+        let extension_types = state.get_extension_types()?;
+        for extension in &extension_types {
+            let default_state_is_supported = *extension == ExtensionType::DefaultAccountState
+                && extension_types.contains(&ExtensionType::MetadataPointer)
+                && extension_types.contains(&ExtensionType::TransferFeeConfig);
             require!(
-                SUPPORTED_EXTENSIONS.contains(&extension),
+                SUPPORTED_EXTENSIONS.contains(extension) || default_state_is_supported,
                 MintError::UnsupportedExtension
             );
         }
@@ -614,6 +965,84 @@ pub struct ApplyPendingBalance<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
+#[derive(Accounts)]
+pub struct TransferWithFee<'info> {
+    /// CHECK: Token-2022 validates the source token account and mint relation.
+    #[account(mut, owner = token_program.key())]
+    pub source: UncheckedAccount<'info>,
+    /// CHECK: parsed by Token-2022 as the transfer mint.
+    #[account(owner = token_program.key())]
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 validates the destination token account and mint relation.
+    #[account(mut, owner = token_program.key())]
+    pub destination: UncheckedAccount<'info>,
+    pub authority: Signer<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct ThawAfterKyc<'info> {
+    /// CHECK: Token-2022 validates the frozen token account.
+    #[account(mut, owner = token_program.key())]
+    pub token_account: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 validates the freeze-authority mint.
+    #[account(owner = token_program.key())]
+    pub mint: UncheckedAccount<'info>,
+    pub freeze_authority: Signer<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct ConfigureConfidentialAccount<'info> {
+    /// CHECK: Token-2022 validates the initialized token account.
+    #[account(mut, owner = token_program.key())]
+    pub token_account: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 validates the confidential-transfer mint.
+    #[account(owner = token_program.key())]
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 validates this proof context account.
+    pub proof_context: UncheckedAccount<'info>,
+    pub owner: Signer<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawConfidential<'info> {
+    /// CHECK: Token-2022 validates the configured confidential account.
+    #[account(mut, owner = token_program.key())]
+    pub token_account: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 validates the confidential-transfer mint.
+    #[account(owner = token_program.key())]
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 validates this proof context account.
+    pub equality_proof_context: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 validates this proof context account.
+    pub range_proof_context: UncheckedAccount<'info>,
+    pub owner: Signer<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct TransferConfidential<'info> {
+    /// CHECK: Token-2022 validates the configured source account.
+    #[account(mut, owner = token_program.key())]
+    pub source: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 validates the confidential-transfer mint.
+    #[account(owner = token_program.key())]
+    pub mint: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 validates the configured destination account.
+    #[account(mut, owner = token_program.key())]
+    pub destination: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 validates this proof context account.
+    pub equality_proof_context: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 validates this proof context account.
+    pub ciphertext_validity_context: UncheckedAccount<'info>,
+    /// CHECK: Token-2022 validates this proof context account.
+    pub range_proof_context: UncheckedAccount<'info>,
+    pub owner: Signer<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
 
 
 #[derive(Accounts)]
@@ -621,9 +1050,7 @@ pub struct ApplyPendingBalance<'info> {
 pub struct CreateSeizableMint<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
- 
-    /// `permanent_delegate` is one of the seven extensions Anchor can express
-    /// as a constraint, so no manual CPI is needed here.
+
     #[account(
         init,
         payer = payer,
@@ -634,6 +1061,18 @@ pub struct CreateSeizableMint<'info> {
     )]
     pub mint: InterfaceAccount<'info, Mint>,
  
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(decimals: u8)]
+pub struct ReissueConfidentialSeizableMint<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK: created and initialized with the complete reissued extension set.
+    #[account(mut, signer)]
+    pub mint: UncheckedAccount<'info>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
@@ -677,4 +1116,6 @@ pub struct PermanentDelegateSeize<'info> {
 pub enum MintError {
     #[msg("mint carries an extension this program has not been written to handle")]
     UnsupportedExtension,
+    #[msg("the transfer fee could not be calculated")]
+    FeeCalculationOverflow,
 }

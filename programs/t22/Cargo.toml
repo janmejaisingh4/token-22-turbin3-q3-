@@ -25,6 +25,8 @@ custom-panic = []
 [dependencies]
 anchor-lang = "1.2.0"
 anchor-spl = { version = "1.2.0", features = ["token_2022", "token_2022_extensions"] }
+zkif = { package = "solana-zk-elgamal-proof-interface", version = "0.1" }
+proofext05 = { package = "spl-token-confidential-transfer-proof-extraction", version = "0.5" }
 
 
 
@@ -42,7 +44,6 @@ zk = { package = "solana-zk-sdk", version = "7" }
 t22new = { package = "spl-token-2022-interface", version = "3.1" }
 proofgen = { package = "spl-token-confidential-transfer-proof-generation", version = "0.6" }
 proofext = { package = "spl-token-confidential-transfer-proof-extraction", version = "0.6" }
-zkif = { package = "solana-zk-elgamal-proof-interface", version = "0.1" }
 bytemuck = "1"
 
 [lints.rust]
