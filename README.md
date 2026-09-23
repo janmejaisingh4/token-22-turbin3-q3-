@@ -80,6 +80,16 @@ cargo test -p t22 --test confidential
 
 The confidential tests use LiteSVM and load `target/deploy/t22.so`, so run `anchor build` before testing when the program artifact does not exist or has changed.
 
+## Build and Test Results
+
+Successful Anchor build and initial test execution:
+
+![Anchor build and test output](Screenshot/S1.png)
+
+Complete `cargo test` output showing the authority, confidential-transfer, and initialization suites passing:
+
+![Complete cargo test output](Screenshot/S2.png)
+
 ## Program Structure
 
 The main program is located at:
